@@ -9,7 +9,11 @@ from torch.autograd import Function
 import torch.nn.functional as F
 import threading
 
+from loss_util import l1_loss, ssim
+
 # https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
+
+image_dir = "images"
 
 def setup_1G_rasterizer():
     rasterizer_1G = slangtorch.loadModule("rasterize_1_G_color.slang")
@@ -20,12 +24,16 @@ def setup_1G_rasterizer():
             output = torch.zeros((width, height, 4), dtype=torch.float).cuda()
             kernel_with_args = rasterizer_1G.rasterize(mean=mean, s=s, r=r, viewM=viewM, projM=projM, color=color, output=output)
             kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
+            ctx.viewM = viewM
+            ctx.projM = projM
             ctx.save_for_backward(mean, s, r, color, output)
             return output
         
         @staticmethod
         def backward(ctx, grad_output):
             mean, s, r, color, output = ctx.saved_tensors
+            viewM = ctx.viewM
+            projM = ctx.projM
             grad_mean = torch.zeros_like(mean)
             grad_s = torch.zeros_like(s)
             grad_r = torch.zeros_like(r)
@@ -38,11 +46,13 @@ def setup_1G_rasterizer():
                 mean=(mean, grad_mean),
                 s=(s, grad_s),
                 r=(r, grad_r),
+                viewM=viewM,
+                projM=projM,
                 color=(color, grad_color),
                 output=(output, grad_output))
             kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
 
-            return None, None, grad_mean, grad_s, grad_r, None, grad_color
+            return None, None, grad_mean, grad_s, grad_r, None, None, grad_color
 
     return Rasterizer1G()
 
@@ -387,9 +397,80 @@ def compare_rast_1_G_color():
     plt.show()
 
 
-# def optimize_1_G_color():
+def set_grad(var):
+    def hook(grad):
+        var.grad = grad
+    return hook
+
+
+def optimize_1_G_color():
+
+    rasterizer = setup_1G_rasterizer()
+
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=128, height=128)
+    mean = torch.Tensor([0, 0, 0, 1]).cuda()
+    s = torch.Tensor([100, 100, 100]).cuda()
+    r = torch.Tensor([1, 0, 0, 0]).cuda()
+    color = torch.Tensor([0, 1, 0, 1]).cuda()
+
+    mean_1 = torch.Tensor([0, 10, 0, 1]).cuda()
+    mean_1.requires_grad = True
+    s_1 = torch.Tensor([100, 100, 100]).cuda()
+    s_1.requires_grad = True
+    r_1 = torch.Tensor([1, 0, 0, 0]).cuda()
+    r_1.requires_grad = True
+    color_1 = torch.Tensor([0, 1, 0, 1]).cuda()
+    color_1.requires_grad = True
+
+    viewM = cam_para.M_view.cuda()
+    projM = cam_para.M_proj.cuda()
+
+    target = rasterizer.apply(cam_para.width, cam_para.height, mean, s, r, viewM, projM, color)
+    learningRate = 5e-3
+    numIterations = 400
+    lambda_opt = 0.2
+    # optimizer = torch.optim.Adam([mean_1, s_1, r_1, color_1], lr=learningRate)
+    optimizer = torch.optim.Adam([
+        {'params': mean_1, 'lr': 0.000016},
+        {'params': s_1, 'lr': 0.005},
+        {'params': r_1, 'lr': 0.001},
+        {'params': color_1, 'lr': 0.0001}
+    ])
+
+    def optimize(i):
+        print("Iteration %d" % i)
+
+        output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
+        output.register_hook(set_grad(output))
+
+        # Ll1 = l1_loss(output, target)
+        # loss = (1.0 - lambda_opt) * Ll1 + lambda_opt * (1.0 - ssim(output, target))
+
+        loss = torch.mean((output - target) ** 2)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    
+    for i in range(numIterations):
+        optimize(i)
+        # store image every 10 iterations
+        if i % 20 == 0:
+            output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
+            output = output.detach().cpu().numpy()
+            output = np.rot90(output)
+            plt.imshow(output)
+            plt.savefig(os.path.join(image_dir, "output_%d.png" % i))
+            plt.close()
+
+
+    output_f = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
+    output_f = output_f.detach().cpu().numpy()
+    output_f = np.rot90(output_f)
+    plt.imshow(output_f)
+    plt.show()
 
 
 # test_rast_1_G_color()
 # test_rast_1_G_color_slang()
-compare_rast_1_G_color()
+# compare_rast_1_G_color()
+optimize_1_G_color()
