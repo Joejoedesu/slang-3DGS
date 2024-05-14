@@ -9,6 +9,64 @@ from torch.autograd import Function
 import torch.nn.functional as F
 import threading
 
+# https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
+
+def setup_1G_rasterizer():
+    rasterizer_1G = slangtorch.loadModule("rasterize_1_G_color.slang")
+
+    class Rasterizer1G(Function):
+        @staticmethod
+        def forward(ctx, width, height, mean, s, r, viewM, projM, color):
+            output = torch.zeros((width, height, 4), dtype=torch.float).cuda()
+            kernel_with_args = rasterizer_1G.rasterize(mean=mean, s=s, r=r, viewM=viewM, projM=projM, color=color, output=output)
+            kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
+            ctx.save_for_backward(mean, s, r, color, output)
+            return output
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            mean, s, r, color, output = ctx.saved_tensors
+            grad_mean = torch.zeros_like(mean)
+            grad_s = torch.zeros_like(s)
+            grad_r = torch.zeros_like(r)
+            grad_color = torch.zeros_like(color)
+
+            width, height = grad_output.shape[0], grad_output.shape[1]
+            grad_output = grad_output.contiguous()
+
+            kernel_with_args = rasterizer_1G.rasterize.bwd(
+                mean=(mean, grad_mean),
+                s=(s, grad_s),
+                r=(r, grad_r),
+                color=(color, grad_color),
+                output=(output, grad_output))
+            kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
+
+            return None, None, grad_mean, grad_s, grad_r, None, grad_color
+
+    return Rasterizer1G()
+
+
+def rasterize_1_G_color_slang(mean, s, r, came_params, color):
+    mean = mean.cuda()
+    s = s.cuda()
+    r = r.cuda()
+    viewM = came_params.M_view.cuda()
+    projM = came_params.M_proj.cuda()
+    color = color.cuda()
+
+    rasterizer = setup_1G_rasterizer()
+    sample = rasterizer.apply(came_params.width, came_params.height, mean, s, r, viewM, projM, color)
+    sample = sample.cpu().numpy()
+    # print(sample[0, 0])
+    # print(sample[1, 0])
+    # print(sample[2, 0])
+    sample = np.rot90(sample)
+    # plt.imshow(sample)
+    # plt.show()
+    return sample
+
+
 class CameraParams:
     def __init__(self, eye, center, up, fov, aspect, near, far, width, height):
         self.eye = eye
@@ -96,7 +154,10 @@ def compute_cov2D(mean, viewM, Vrk, debug=False):
     cov2D = T @ Vrk @ T.t()
     t_cov2D = torch.Tensor([[cov2D[0][0] + 0.3, cov2D[0][1]],
                             [cov2D[1][0], cov2D[1][1] + 0.3]])
+    if debug:
+        print("t_cov2D: ", t_cov2D)
     return t_cov2D                
+
 
 def rast_1_G_color(mean, s, r, came_params, color, debug=False):
     height = came_params.height
@@ -186,13 +247,15 @@ def rast_1_G_color(mean, s, r, came_params, color, debug=False):
             color_copy[3] = alpha
             output[x, y] = color_copy
 
-    output[0, 0] = torch.Tensor([1, 0, 0, 1])
-    output[1, 0] = torch.Tensor([1, 0, 0, 1])
+    # output[0, 0] = torch.Tensor([1, 0, 0, 1])
+    # output[1, 0] = torch.Tensor([1, 0, 0, 1])
     # torch to np array
     output = output.cpu().numpy()
     output = np.rot90(output)
-    plt.imshow(output)
-    plt.show()
+    # plt.imshow(output)
+    # plt.show()
+    return output
+
 
 def in_triangle(x, y, x1, y1, x2, y2, x3, y3):
     def tri_sign(x, y, x1, y1, x0, y0):
@@ -202,6 +265,7 @@ def in_triangle(x, y, x1, y1, x2, y2, x3, y3):
     b3 = tri_sign(x, y, x1, y1, x3, y3) < 0
     return b1 and b2 and b3
 
+
 def batch_rasterize(x, y, x_r, y_r, vertices_screen, color, output):
     for i in range(x_r):
         for j in range(y_r):
@@ -209,6 +273,7 @@ def batch_rasterize(x, y, x_r, y_r, vertices_screen, color, output):
             y_ = y + j
             if in_triangle(x_, y_, vertices_screen[0][0], vertices_screen[0][1], vertices_screen[1][0], vertices_screen[1][1], vertices_screen[2][0], vertices_screen[2][1]):
                 output[int(x_), int(y_)] = color
+
 
 def rasterize_tri_3D(vertices, color, camera_params):
     width, height = camera_params.width, camera_params.height
@@ -264,8 +329,9 @@ def rasterize_tri_3D(vertices, color, camera_params):
     # torch to np array
     output = output.cpu().numpy()
     output = np.rot90(output)
-    plt.imshow(output)
-    plt.show()
+    # plt.imshow(output)
+    # plt.show()
+    return output
 
 
 def test_tri_rast():
@@ -278,12 +344,52 @@ def test_tri_rast():
     color = torch.Tensor([0, 1, 0, 1])
     rasterize_tri_3D(torch.stack([p0, p1, p2]), color, cam_para)
 
+
 def test_rast_1_G_color():
-    cam_para = CameraParams(eye=torch.Tensor([20, 0, 50]), center=torch.Tensor([20, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=30, height=30)
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=30, height=30)
     mean = torch.Tensor([0, 0, 0, 1])
     s = torch.Tensor([100, 100, 100])
     r = torch.Tensor([1, 0, 0, 0])
     color = torch.Tensor([0, 1, 0, 1])
     rast_1_G_color(mean, s, r, cam_para, color, debug=False)
 
-test_rast_1_G_color()
+
+def test_rast_1_G_color_slang():
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=30, height=30)
+    mean = torch.Tensor([0, 0, 0, 1])
+    s = torch.Tensor([100, 100, 100])
+    r = torch.Tensor([1, 0, 0, 0])
+    color = torch.Tensor([0, 1, 0, 1])
+    rasterize_1_G_color_slang(mean, s, r, cam_para, color)
+
+
+def compare_rast_1_G_color():
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=128, height=128)
+    mean = torch.Tensor([0, 0, 0, 1])
+    s = torch.Tensor([100, 100, 100])
+    r = torch.Tensor([1, 0, 0, 0])
+    color = torch.Tensor([0, 1, 0, 1])
+
+    mean_1 = mean.clone()
+    s_1 = s.clone()
+    r_1 = r.clone()
+    color_1 = color.clone()
+
+    out_GT = rast_1_G_color(mean, s, r, cam_para, color, debug=False)
+    out_slang = rasterize_1_G_color_slang(mean_1, s_1, r_1, cam_para, color_1)
+    diff = np.mean((out_GT - out_slang)**2)
+    print("diff: ", diff)
+    plt.figure
+    plt.subplot(1, 2, 1)
+    plt.imshow(out_GT)
+    plt.subplot(1, 2, 2)
+    plt.imshow(out_slang)
+    plt.show()
+
+
+# def optimize_1_G_color():
+
+
+# test_rast_1_G_color()
+# test_rast_1_G_color_slang()
+compare_rast_1_G_color()
