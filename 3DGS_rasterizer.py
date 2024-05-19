@@ -403,11 +403,31 @@ def set_grad(var):
     return hook
 
 
+def get_G_color_op(iteration):
+    iterations = 30_000
+    position_lr_init = 0.00016
+    position_lr_final = 0.0000016
+    position_lr_delay_mult = 0.01
+    position_lr_max_steps = 30_000
+    feature_lr = 0.0025
+    opacity_lr = 0.05
+    scaling_lr = 0.005
+    rotation_lr = 0.001
+    percent_dense = 0.01
+    lambda_dssim = 0.2
+    densification_interval = 100
+    opacity_reset_interval = 3000
+    densify_from_iter = 500
+    densify_until_iter = 15_000
+    densify_grad_threshold = 0.0002
+    return
+
+
 def optimize_1_G_color():
 
     rasterizer = setup_1G_rasterizer()
 
-    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=128, height=128)
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=32, height=32)
     mean = torch.Tensor([0, 0, 0, 1]).cuda()
     s = torch.Tensor([100, 100, 100]).cuda()
     r = torch.Tensor([1, 0, 0, 0]).cuda()
@@ -426,19 +446,26 @@ def optimize_1_G_color():
     projM = cam_para.M_proj.cuda()
 
     target = rasterizer.apply(cam_para.width, cam_para.height, mean, s, r, viewM, projM, color)
+    target_show = target.detach().cpu().numpy()
+    target_show = np.rot90(target_show)
+    plt.imshow(target_show)
+    plt.show()
+
     learningRate = 5e-3
-    numIterations = 400
+    numIterations = 4000
     lambda_opt = 0.2
     # optimizer = torch.optim.Adam([mean_1, s_1, r_1, color_1], lr=learningRate)
     optimizer = torch.optim.Adam([
-        {'params': mean_1, 'lr': 0.000016},
+        {'params': mean_1, 'lr': 0.016},
         {'params': s_1, 'lr': 0.005},
         {'params': r_1, 'lr': 0.001},
         {'params': color_1, 'lr': 0.0001}
     ])
 
     def optimize(i):
-        print("Iteration %d" % i)
+        # print("Iteration %d" % i)
+
+        optimizer.zero_grad()
 
         output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
         output.register_hook(set_grad(output))
@@ -449,18 +476,20 @@ def optimize_1_G_color():
         loss = torch.mean((output - target) ** 2)
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad()
     
     for i in range(numIterations):
         optimize(i)
         # store image every 10 iterations
         if i % 20 == 0:
-            output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
-            output = output.detach().cpu().numpy()
-            output = np.rot90(output)
-            plt.imshow(output)
-            plt.savefig(os.path.join(image_dir, "output_%d.png" % i))
-            plt.close()
+            with torch.no_grad():
+                output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
+                output = output.detach().cpu().numpy()
+                output = np.rot90(output)
+                mean_1_np = mean_1.detach().cpu().numpy()
+                plt.imshow(output)
+                plt.savefig(os.path.join(image_dir, "output_%d.png" % i))
+                plt.close()
+                print(i, "mean_1: ", mean_1_np)
 
 
     output_f = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
