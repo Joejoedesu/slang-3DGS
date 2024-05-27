@@ -175,6 +175,36 @@ class Plt3DGS:
     def get_color(self, cam_loc):
         return compute_color_from_sh(self, cam_loc)
 
+def get_sample_camera():
+    # 195
+    ViewM_T = [[ 0.5077,  0.0065, -0.8615,  0.0000],
+        [ 0.0831,  0.9949,  0.0564,  0.0000],
+        [ 0.8575, -0.1002,  0.5046,  0.0000],
+        [-1.5442, -0.0462,  2.3823,  1.0000]]
+    ViewM_T = np.array(ViewM_T)
+    ViewM =ViewM_T.transpose()
+    # print(ViewM)
+    projM = [[ 1.1839,  0.0000,  0.0000,  0.0000],
+        [ 0.0000,  2.1370,  0.0000,  0.0000],
+        [ 0.0000,  0.0000,  1.0001,  1.0000],
+        [ 0.0000,  0.0000, -0.0100,  0.0000]]
+    projM = np.array(projM)
+
+    pos = [2.8366644028087706, 0.03986117836440167, 0.11750136379034062]
+    pos = np.array(pos)
+
+    full_proj_transform = np.matmul(projM, ViewM)
+    full_proj_transform_copy = [[ 0.6010,  0.0138, -0.8616, -0.8615],
+        [ 0.0984,  2.1262,  0.0564,  0.0564],
+        [ 1.0152, -0.2142,  0.5046,  0.5046],
+        [-1.8281, -0.0987,  2.3726,  2.3823]]
+    full_proj_transform_copy = np.array(full_proj_transform_copy)
+    cam_params = {'viewM': ViewM,
+                  'projM': projM,
+                  'full_proj_transform': full_proj_transform_copy,
+                  'pos': pos}
+    return cam_params
+
 def sample_depth():
     width = 980
     height = 545

@@ -9,6 +9,7 @@ from torch.autograd import Function
 import torch.nn.functional as F
 import threading
 
+import 3DGS_loader
 from loss_util import l1_loss, ssim
 
 # https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
