@@ -214,6 +214,8 @@ def rast_1_G_color(mean, s, r, came_params, color, debug=False):
         print("mean_came: ", mean_came)
         print("mean_NDC: ", mean_NDC)
         print("mean_screen: ", mean_screen)
+    
+    # we just need the conic and the mean_screen
 
     # rasterize
     output = torch.zeros((width, height, 4), dtype=torch.float)
@@ -264,6 +266,87 @@ def rast_1_G_color(mean, s, r, came_params, color, debug=False):
     output = np.rot90(output)
     # plt.imshow(output)
     # plt.show()
+    return output
+
+
+def world_to_screen(mean, came_params):
+    # non batch version
+    mean_came = torch.zeros_like(mean)
+    for i in range(mean.shape[0]):
+        mean_came[i] = came_params.M_view @ mean[i]
+
+    mean_NDC = torch.zeros_like(mean)
+    for i in range(mean.shape[0]):
+        mean_NDC[i] = came_params.M_proj @ mean_came[i]
+    for i in range(mean_NDC.shape[0]):
+        mean_NDC[i] = mean_NDC[i] / mean_NDC[i][3]
+    mean_screen = torch.zeros_like(mean)
+    for i in range(mean_NDC.shape[0]):
+        mean_screen[i][0] = came_params.width * (mean_NDC[i][0] + 1) / 2
+        mean_screen[i][1] = came_params.height * (mean_NDC[i][1] + 1) / 2
+    return mean_screen
+
+
+def G_2D_projection(mean, s, r, came_params):
+    conic = torch.zeros((mean.shape[0], 3))
+    for i in range(mean.shape[0]):
+        R = quart_to_rot(r[i])
+        S = s_to_scale(s[i])
+        cov3D = R @ S @ S.t() @ R.t()
+        cov2D = compute_cov2D(mean[i], came_params.M_view, cov3D)
+        det = torch.det(cov2D)
+        det_inv = 1.0 / det
+        conic[i][0] = cov2D[1][1] * det_inv
+        conic[i][1] = -cov2D[0][1] * det_inv
+        conic[i][2] = cov2D[0][0] * det_inv
+    return conic
+
+
+def rast_n_G_color(means, s, r, came_params, color):
+    # convert means to view space
+    means_came = torch.zeros_like(means)
+    for i in range(means.shape[0]):
+        means_came[i] = came_params.M_view @ means[i]
+    
+    # sort the means by depth
+    indices = torch.argsort(means_came[:, 2], descending=True)
+    means_came = means_came[indices]
+    s = s[indices]
+    r = r[indices]
+    color = color[indices]
+
+    means_screen = world_to_screen(means, came_params)
+    conics = G_2D_projection(means, s, r, came_params)
+
+    # rasterize
+    output = torch.zeros((came_params.width, came_params.height, 4), dtype=torch.float)
+    for i in range(came_params.width):
+        for j in range(came_params.height):
+            T = 1.0
+            done = False
+            for k in range(means.shape[0]):
+                if done:
+                    break
+                x_ = i - means_screen[k][0]
+                y_ = j - means_screen[k][1]
+                power_con = -0.5 * (conics[k][0] * x_**2 + 2 * conics[k][1] * x_ * y_ + conics[k][2] * y_**2)
+                if power_con > 0:
+                    continue
+                alpha = min(0.99, color[k][3] * torch.exp(power_con))
+                if alpha < 1.0/255.0:
+                    continue
+                test_T = T * (1-alpha)
+                if test_T < 0.0001:
+                    done = True
+                    continue
+                color_copy = color[k].clone()
+                color_copy = color_copy * alpha * T
+                output[i, j] = color_copy + output[i, j]
+                T = test_T
+    output = output.cpu().numpy()
+    output = np.rot90(output)
+    plt.imshow(output)
+    plt.show()
     return output
 
 
@@ -371,6 +454,15 @@ def test_rast_1_G_color_slang():
     r = torch.Tensor([1, 0, 0, 0])
     color = torch.Tensor([0, 1, 0, 1])
     rasterize_1_G_color_slang(mean, s, r, cam_para, color)
+
+
+def test_rast_n_G_color():
+    cam_para = CameraParams(eye=torch.Tensor([50, 0, 0]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=10, far=5000, width=30, height=30)
+    means = torch.Tensor([[0, 0, 0, 1], [0, 0, -4, 1], [10, 0, -10, 1]])
+    s = torch.Tensor([[100, 100, 100], [100, 100, 100], [100, 100, 100]])
+    r = torch.Tensor([[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]])
+    color = torch.Tensor([[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]])
+    rast_n_G_color(means, s, r, cam_para, color)
 
 
 def compare_rast_1_G_color():
@@ -502,4 +594,5 @@ def optimize_1_G_color():
 # test_rast_1_G_color()
 # test_rast_1_G_color_slang()
 # compare_rast_1_G_color()
-optimize_1_G_color()
+# optimize_1_G_color()
+test_rast_n_G_color()
