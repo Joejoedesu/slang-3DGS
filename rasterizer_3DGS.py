@@ -1,7 +1,7 @@
 import slangtorch
 import torch
 import numpy as np
-import timeit
+import time
 import os
 import math
 import matplotlib.pyplot as plt
@@ -9,7 +9,7 @@ from torch.autograd import Function
 import torch.nn.functional as F
 import threading
 
-import loader_3DGS
+from loader_3DGS import get_sample_camera, Plt3DGS
 from loss_util import l1_loss, ssim
 
 # https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
@@ -350,6 +350,41 @@ def rast_n_G_color(means, s, r, came_params, color):
     plt.show()
     return output
 
+def rast_3DGS_scane(plt3DGS, cam_para):
+    start = time.time()
+    means = plt3DGS._xyz
+    opacity = plt3DGS._opacity
+    colors = plt3DGS._colors
+    r = plt3DGS._rotation
+    s = plt3DGS._scaling
+    means = torch.Tensor(means)
+    mean_ones = torch.ones((means.shape[0], 1))
+    means = torch.cat((means, mean_ones), dim=1)
+
+    viewM = cam_para['viewM']
+    projM = cam_para['projM']
+    full_projM = cam_para['full_proj_transform']
+    cam_loc = cam_para['camera_center']
+    cam_loc = np.append(cam_loc, 1)
+    viewM = torch.Tensor(viewM)
+    projM = torch.Tensor(projM)
+    full_projM = torch.Tensor(full_projM)
+    cam_loc = torch.Tensor(cam_loc)
+
+    means_cam = torch.zeros_like(means)
+    for i in range(means.shape[0]):
+        means_cam[i] = viewM @ means[i]
+
+    indices = torch.argsort(means_cam[:, 2], descending=True)
+    means_cam = means_cam[indices]
+    s = s[indices]
+    r = r[indices]
+    colors = colors[indices]
+    opacity = opacity[indices]
+
+    end = time.time()
+    print("time: ", end - start)
+
 
 def in_triangle(x, y, x1, y1, x2, y2, x3, y3):
     def tri_sign(x, y, x1, y1, x0, y0):
@@ -465,6 +500,14 @@ def test_rast_n_G_color():
     color = torch.Tensor([[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]])
     rast_n_G_color(means, s, r, cam_para, color)
 
+def test_3DGS_scene_Train():
+    sh_degree = 3
+    cam_para = get_sample_camera()
+    cur_dir = os.path.dirname(os.path.realpath(__file__))
+    ply_path = os.path.join(cur_dir, "models/train/point_cloud/iteration_30000/point_cloud.ply")
+    plt_3DGS = Plt3DGS(sh_degree, ply_path)
+    plt_3DGS.get_color(cam_para['camera_center'])
+    rast_3DGS_scane(plt_3DGS, cam_para)
 
 def compare_rast_1_G_color():
     cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=128, height=128)
@@ -596,4 +639,5 @@ def optimize_1_G_color():
 # test_rast_1_G_color_slang()
 # compare_rast_1_G_color()
 # optimize_1_G_color()
-test_rast_n_G_color()
+# test_rast_n_G_color()
+test_3DGS_scene_Train()

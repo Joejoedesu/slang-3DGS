@@ -173,7 +173,8 @@ class Plt3DGS:
         # active_sh_degree = self.max_sh_degree
     
     def get_color(self, cam_loc):
-        return compute_color_from_sh(self, cam_loc)
+        self._colors = compute_color_from_sh(self, cam_loc)
+        return
 
 def get_sample_camera():
     # 195
@@ -190,8 +191,8 @@ def get_sample_camera():
         [ 0.0000,  0.0000, -0.0100,  0.0000]]
     projM = np.array(projM)
 
-    pos = [2.8366644028087706, 0.03986117836440167, 0.11750136379034062]
-    pos = np.array(pos)
+    loc = [2.8366644028087706, 0.03986117836440167, 0.11750136379034062]
+    loc = np.array(loc)
 
     full_proj_transform = np.matmul(projM, ViewM)
     full_proj_transform_copy = [[ 0.6010,  0.0138, -0.8616, -0.8615],
@@ -202,7 +203,7 @@ def get_sample_camera():
     cam_params = {'viewM': ViewM,
                   'projM': projM,
                   'full_proj_transform': full_proj_transform_copy,
-                  'pos': pos}
+                  'camera_center': loc}
     return cam_params
 
 def sample_depth():
@@ -336,6 +337,11 @@ def sample_depth():
     plt.imshow(canvas)
     plt.show()
 
+
+# sample_depth()
+
+##################### JUNK CODE #####################
+
     # depth_map = np.zeros((height, width))
     # xy_distribution = np.zeros((200, 200))
     # for idx, point in enumerate(plt3dgs._xyz):
@@ -357,8 +363,6 @@ def sample_depth():
         # y = int((point[1] + 1) * 1000)
         # xy_distribution[x, y] += 1
         # # depth_map[y, x] = point[2]
-
-sample_depth()
 
 # def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
 #     """Read and unpack the next bytes from a binary file.
