@@ -5,19 +5,34 @@ import time
 import os
 import math
 import matplotlib
-matplotlib.use('Agg')
+# matplotlib.use('Agg')
+matplotlib.use('TkAgg')
 from matplotlib import pyplot as plt
 from torch.autograd import Function
 import torch.nn.functional as F
 import threading
 import random
+from PIL import Image
 
 from loader_3DGS import get_sample_camera, Plt3DGS
-from loss_util import l1_loss, ssim
+from loss_util import l1_loss, ssim, get_expon_lr_func
 
 # https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
 
-image_dir = "images"
+image_dir_root = "images"
+gaussian_dir = "gaussian"
+blender_dir = "blender"
+
+image_gaussian_dir = os.path.join(image_dir_root, gaussian_dir)
+image_blender_dir = os.path.join(image_dir_root, blender_dir)
+
+
+def update_learning_rate(optimizer, lr_func, step):
+    lr = lr_func(step)
+    for param_group in optimizer.param_groups:
+        if param_group['name'] == 'means':
+            param_group['lr'] = lr
+            return lr
 
 def setup_1G_rasterizer():
     rasterizer_1G = slangtorch.loadModule("rasterize_1_G_color.slang")
@@ -86,7 +101,7 @@ def setup_nG_rasterizer():
     class RasterizernG(Function):
         @staticmethod
         def forward(ctx, width, height, mean, s, r, viewM, projM, view_angle, gaussian_range, color):
-            output = torch.zeros((width, height, 4), dtype=torch.float).cuda()
+            output = torch.zeros((width, height, 4), dtype=torch.float).cuda().requires_grad_(True)
             kernel_with_args = rasterizer_nG.rasterize(mean=mean, s=s, r=r, viewM=viewM, projM=projM, color=color, view_angle=view_angle, gaussian_range=gaussian_range, output=output)
             kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
             ctx.viewM = viewM
@@ -170,6 +185,113 @@ def rasterize_n_G_color_slang(means, s, r, came_params, color):
     plt.show()
     return sample
 
+def setup_scene_rasterizer():
+    rasterizer_scene = slangtorch.loadModule("rasterize_n_G_scene.slang")
+
+    class RasterizerG_scene(Function):
+        @staticmethod
+        def forward(ctx, width, height, mean, s, r, viewM, projM, view_angle, gaussian_range, color, pre_input):                    
+            output = torch.zeros((width, height, 5), dtype=torch.float).cuda()
+            kernel_with_args = rasterizer_scene.rasterize(mean=mean, s=s, r=r, viewM=viewM, projM=projM, color=color, view_angle=view_angle, gaussian_range=gaussian_range, pre_input=pre_input, output=output)
+            kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
+            ctx.viewM = viewM
+            ctx.projM = projM
+            ctx.view_angle = view_angle
+            ctx.gaussian_range = gaussian_range
+            ctx.pre_input = pre_input
+            ctx.save_for_backward(mean, s, r, color, output)
+            return output
+        
+        @staticmethod
+        def backward(ctx, grad_output):
+            mean, s, r, color, output = ctx.saved_tensors
+            viewM = ctx.viewM
+            projM = ctx.projM
+            view_angle = ctx.view_angle
+            gaussian_range = ctx.gaussian_range
+            pre_input = ctx.pre_input
+            grad_mean = torch.zeros_like(mean)
+            grad_s = torch.zeros_like(s)
+            grad_r = torch.zeros_like(r)
+            grad_color = torch.zeros_like(color)
+
+            width, height = grad_output.shape[0], grad_output.shape[1]
+            grad_output = grad_output.contiguous()
+
+            kernel_with_args = rasterizer_scene.rasterize.bwd(
+                mean=(mean, grad_mean),
+                s=(s, grad_s),
+                r=(r, grad_r),
+                viewM=viewM,
+                projM=projM,
+                view_angle=view_angle,
+                gaussian_range=gaussian_range,
+                color=(color, grad_color),
+                pre_input=pre_input,
+                output=(output, grad_output))
+            kernel_with_args.launchRaw(blockSize=(16, 16, 1), gridSize=((width + 15)//16, (height + 15)//16, 1))
+
+            return None, None, grad_mean, grad_s, grad_r, None, None, None, None, grad_color, None
+
+    return RasterizerG_scene()
+
+def rasterize_n_G_scene_slang(means, s, r, came_params, color):
+    means_came = torch.zeros_like(means)
+    for i in range(means.shape[0]):
+        means_came[i] = came_params.M_view @ means[i]
+    
+    # sort the means by depth
+    indices = torch.argsort(means_came[:, 2], descending=True)
+    s = s[indices]
+    r = r[indices]
+    color = color[indices]
+    means = means[indices]
+
+    means = means.cuda()
+    s = s.cuda()
+    r = r.cuda()
+    viewM = came_params.M_view.cuda()
+    projM = came_params.M_proj.cuda()
+    color = color.cuda()
+    view_angle_rad = came_params.fov * math.pi / 180
+    tanfovx = math.tan(view_angle_rad * 0.5)
+    tanfovy = math.tan(view_angle_rad * 0.5)
+    focal_y = came_params.height / (2.0 * tanfovy)
+    focal_x = came_params.width / (2.0 * tanfovx)
+    view_angle = torch.Tensor([tanfovx, tanfovy, focal_x, focal_y]).cuda()
+    rasterizer = setup_scene_rasterizer()
+    gaussian_range = means.shape[0]
+    assert gaussian_range <= 5 # only support 5 gaussians
+    
+    pre_input = torch.zeros((came_params.width, came_params.height, 5), dtype=torch.float)
+    # last channel set to 1
+    pre_input[:, :, 4] = 1
+    pre_input = pre_input.cuda()
+
+    cur_id = 0
+    max_gaussian = 2
+    while cur_id < means.shape[0]:
+        end_id = min(cur_id + max_gaussian, means.shape[0])
+        means_i = means[cur_id:end_id]
+        s_i = s[cur_id:end_id]
+        r_i = r[cur_id:end_id]
+        color_i = color[cur_id:end_id]
+        pre_input = rasterizer.apply(came_params.width, came_params.height, means_i, s_i, r_i, viewM, projM, view_angle, end_id-cur_id, color_i, pre_input)
+        cur_id = end_id
+
+
+    pre_input = pre_input.cpu().numpy()
+
+    # get the first 4 channels
+    pre_input = pre_input[:, :, :4]
+    # print(sample[13, 13])
+    # print(sample[13, 12])
+    # print(sample[1, 3])
+    # print(sample[2, 3])
+    sample = np.rot90(pre_input)
+    plt.imshow(sample)
+    plt.show()
+    return sample
 
 class CameraParams:
     def __init__(self, eye, center, up, fov, aspect, near, far, width, height):
@@ -472,7 +594,44 @@ def rast_n_G_color(means, s, r, came_params, color):
     plt.show()
     return output
 
+def compute_conv2D_scene(mean, s, r, focal_x, focal_y, tan_fovx, tan_fovy, viewM, projM, debug=False):
+    R = quart_to_rot(r)
+    S = s_to_scale(s)
+    Vrk = R @ S @ S.t() @ R.t()
+
+    t = viewM @ mean
+    limx = 1.3 * tan_fovx
+    limy = 1.3 * tan_fovy
+    txtz = t[0] / t[2]
+    tytz = t[1] / t[2]
+    t[0] = min(limx, max(-limx, txtz)) * t[2]
+    t[1] = min(limy, max(-limy, tytz)) * t[2]
+
+    J_ = torch.Tensor([[1/t[2], 0, -t[0]/t[2]**2],
+                      [0, 1/t[2], -t[1]/t[2]**2],
+                      [0,0,0]])
+    # J_ = torch.Tensor([[focal_x/t[2], 0, -(focal_x*t[0])/t[2]**2],
+    #                   [0, focal_y/t[2], -(focal_y * t[1])/t[2]**2],
+    #                   [0,0,0]])
+    if debug:
+        print("J: ", J_)
+    W = torch.Tensor([[viewM[0][0], viewM[0][1], viewM[0][2]],
+                      [viewM[1][0], viewM[1][1], viewM[1][2]],
+                      [viewM[2][0], viewM[2][1], viewM[2][2]]])
+    if debug:
+        print("W: ", W)
+    T = J_ @ W
+    cov2D = T @ Vrk @ T.t()
+    t_cov2D = torch.Tensor([[cov2D[0][0] + 0.3, cov2D[0][1]],
+                            [cov2D[1][0], cov2D[1][1] + 0.3]])
+    if debug:
+        print("t_cov2D: ", t_cov2D)
+    return t_cov2D      
+
+
 def rast_3DGS_scene(plt3DGS, cam_para):
+    width = plt3DGS._width
+    height = plt3DGS._height
     start = time.time()
     means = plt3DGS._xyz
     opacity = plt3DGS._opacity
@@ -480,32 +639,259 @@ def rast_3DGS_scene(plt3DGS, cam_para):
     r = plt3DGS._rotation
     s = plt3DGS._scaling
     means = torch.Tensor(means)
+    opacity = torch.Tensor(opacity)
+    colors = torch.Tensor(colors)
+    r = torch.Tensor(r)
+    s = torch.Tensor(s)
+
     mean_ones = torch.ones((means.shape[0], 1))
     means = torch.cat((means, mean_ones), dim=1)
 
     viewM = cam_para['viewM']
     projM = cam_para['projM']
     full_projM = cam_para['full_proj_transform']
-    cam_loc = cam_para['camera_center']
-    cam_loc = np.append(cam_loc, 1)
     viewM = torch.Tensor(viewM)
     projM = torch.Tensor(projM)
     full_projM = torch.Tensor(full_projM)
-    cam_loc = torch.Tensor(cam_loc)
+    means_cam = torch.zeros_like(means)
+    with torch.no_grad():
+        for i in range(means.shape[0]):
+            means_cam[i] = viewM @ means[i]
+
+        indices = torch.argsort(means_cam[:, 2], descending=False)
+        means_cam = means_cam[indices]  # at idx 114627, the depth is 0.2
+
+        s = s[indices]
+        r = r[indices]
+        colors = colors[indices]
+        opacity = opacity[indices]
+        means = means[indices]
+
+    end = time.time()
+    print("time: ", end - start)
+
+    # means = means.detach().cpu().numpy()
+    # s = s.detach().cpu().numpy()
+    # r = r.detach().cpu().numpy()
+    # viewM = viewM.detach().cpu().numpy()
+    # projM = projM.detach().cpu().numpy()
+    # colors = colors.detach().cpu().numpy()
+
+    num_points = means.shape[0]
+    output = torch.zeros((num_points, 3))
+    conv2D = torch.zeros((num_points, 2, 2))
+    # start timer
+    start = time.time()
+    
+    tanfovx = math.tan(plt3DGS.FoVx * 0.5)
+    tanfovy = math.tan(plt3DGS.FoVy * 0.5)
+    focal_y = plt3DGS._height / (2.0 * tanfovy)
+    focal_x = plt3DGS._width / (2.0 * tanfovx)
+    print("focal_x: ", focal_x)
+    print("focal_y: ", focal_y)
+    print("tanfovx: ", tanfovx)
+    print("tanfovy: ", tanfovy)
+    print("FoVx: ", plt3DGS.FoVx)
+    print("FoVy: ", plt3DGS.FoVy)
+    return
+
+    canvas = torch.zeros((width, height, 5))
+    # canvas[:, :, 4] = 1
+    st = 157000 # start at 150000
+    only_points = False
+    with torch.no_grad():
+        # for idx in range(50000, ):
+        for idx in range(st, st+3000):
+            debug = False
+            if idx % 1000 == 0:
+                print("idx: ", idx)
+                print(s[idx])
+                debug = True
+            point = means[idx]
+            point1 = viewM @ point
+            # if point1[2] < 0.2:
+            #     # print("too close")
+            #     continue
+            point2 = projM @ point1
+            # point1 = np.matmul(full_proj_transform, point)
+            point3 = point2 / point2[3]
+            output[idx] = point3[0:3]
+            conv2D[idx] = compute_conv2D_scene(point, s[idx], r[idx], focal_x, focal_y, tanfovx, tanfovy, viewM, projM, debug=debug)
+            det = torch.det(conv2D[idx])
+            conic = [conv2D[idx][1][1] / det, -conv2D[idx][0][1] / det, conv2D[idx][0][0] / det]
+            mid = 0.5 * (conv2D[idx][0][0] + conv2D[idx][1][1])
+            lambda1 = mid + math.sqrt(max(0.1, mid**2 - det))
+            lambda2 = mid - math.sqrt(max(0.1, mid**2 - det))
+            radius = math.ceil(3 * math.sqrt(max(lambda1, lambda2)))
+            screen_x = int(((output[idx][0]/100+ 1) * width - 1) * 0.5)
+            screen_y = int(((output[idx][1]/100+ 1) * height - 1) * 0.5)
+
+            if only_points:
+                if screen_x < 0 or screen_x >= width or screen_y < 0 or screen_y >= height:
+                    continue
+                canvas[screen_x, screen_y, 0:3] = colors[idx][0:3]
+            else:
+                if idx % 100 == 0:
+                    print("idx: ", idx, radius)
+                #     for x in range(max(0, screen_x - radius), min(width, screen_x + radius)):
+                #         for y in range(max(0, screen_y - radius), min(height, screen_y + radius)):
+                #             x_ = float(x) - screen_x
+                #             y_ = float(y) - screen_y
+                #             power_con = -0.5 * (conic[0] * x_**2 + 2 * conic[1] * x_ * y_ + conic[2] * y_**2)
+                #             if power_con > 0:
+                #                 continue
+                #             alpha = min(0.99, opacity[idx] * torch.exp(power_con))
+                #             if alpha < 1.0/255.0:
+                #                 continue
+                #             test_T = 1.0 * (1-alpha)
+                #             if test_T < 0.0001:
+                #                 continue
+                #             color_copy = colors[idx].clone()
+                #             canvas[x, y, 0:3] = color_copy
+                #             canvas[x, y, 4] = alpha
+                for x in range(max(0, screen_x - radius), min(width, screen_x + radius)):
+                    for y in range(max(0, screen_y - radius), min(height, screen_y + radius)):
+                        if canvas[x, y, -1] == 1:
+                            continue
+
+                        canvas[x, y, -1] = 1
+                        canvas[x, y, 0:3] = colors[idx][0:3]
+
+                # x_ = float(x) - screen_x
+                # y_ = float(y) - screen_y
+                # power_con = -0.5 * (conic[0] * x_**2 + 2 * conic[1] * x_ * y_ + conic[2] * y_**2)
+                # if power_con > 0:
+                #     continue
+                # alpha = min(0.99, colors[idx][3] * torch.exp(power_con))
+                # if alpha < 1.0/255.0:
+                #     continue
+                # test_T = 1.0 * (1-alpha)
+                # if test_T < 0.0001:
+                #     continue
+                # color_copy = colors[idx].clone()
+                # color_copy[3] = alpha
+                # canvas[x, y] = color_copy
+
+    end = time.time()
+    print("Time taken in seconds: ", end - start)
+    print("finish")
+
+    # g_in_scene = []
+
+    # for idx in range(0, num_points):
+    #     if output[idx][0] < -100 or output[idx][0] > 100 or output[idx][1] < -100 or output[idx][1] > 100:
+    #         continue
+    #     g_in_scene.append(idx)
+    #     x = int((output[idx][0]/100 + 1) * 0.5 * width)
+    #     y = int((output[idx][1]/100 + 1) * 0.5 * height)
+    #     # canvas[x, y] = [output[idx][2], output[idx][2], output[idx][2]]
+    #     canvas[x, y] = [colors[idx][0], colors[idx][1], colors[idx][2]]
+    
+    # print(len(g_in_scene))
+    # print(min_depth, max_depth)
+    # canvas = (canvas - min_depth)/(max_depth - min_depth)
+    # canvas = np.sqrt(canvas)
+    # print(canvas[g_in_scene[0]])
+    # print(output[g_in_scene[0]])
+    canvas = canvas.detach().cpu().numpy()
+    canvas = canvas[:, :, 0:3]
+    canvas = np.rot90(canvas)
+    plt.imshow(canvas)
+    plt.show()
+
+
+def rast_3DGS_scene_slang(plt3DGS, cam_para):
+    start = time.time()
+    means = plt3DGS._xyz
+    opacity = plt3DGS._opacity
+    colors = plt3DGS._colors
+    r = plt3DGS._rotation
+    s = plt3DGS._scaling
+    means = torch.Tensor(means)
+    opacity = torch.Tensor(opacity)
+    colors = torch.Tensor(colors)
+    r = torch.Tensor(r)
+    s = torch.Tensor(s)
+
+    # means = plt3DGS._xyz
+    # opacity = plt3DGS._opacity
+    # colors = plt3DGS._colors
+    # r = plt3DGS._rotation
+    # s = plt3DGS._scaling
+    means = torch.Tensor(means)
+    mean_ones = torch.ones((means.shape[0], 1))
+    means = torch.cat((means, mean_ones), dim=1)
+
+    viewM = cam_para['viewM']
+    projM = cam_para['projM']
+    full_projM = cam_para['full_proj_transform']
+    viewM = torch.Tensor(viewM)
+    projM = torch.Tensor(projM)
+    full_projM = torch.Tensor(full_projM)
+    # cam_loc = cam_para['camera_center']
+    # cam_loc = np.append(cam_loc, 1)
+    # cam_loc = torch.Tensor(cam_loc)
 
     means_cam = torch.zeros_like(means)
     for i in range(means.shape[0]):
         means_cam[i] = viewM @ means[i]
 
-    indices = torch.argsort(means_cam[:, 2], descending=True)
+    indices = torch.argsort(means_cam[:, 2], descending=False)
     means_cam = means_cam[indices]
     s = s[indices]
     r = r[indices]
     colors = colors[indices]
     opacity = opacity[indices]
+    means = means[indices]
 
     end = time.time()
     print("time: ", end - start)
+
+    means = means.cuda()
+    s = s.cuda()
+    r = r.cuda()
+    viewM = viewM.cuda()
+    projM = projM.cuda()
+    colors = colors.cuda()
+    tanfovx = math.tan(plt3DGS.FoVx * 0.5)
+    tanfovy = math.tan(plt3DGS.FoVy * 0.5)
+    focal_y = plt3DGS._height / (2.0 * tanfovy)
+    focal_x = plt3DGS._width / (2.0 * tanfovx)
+    view_angle = torch.Tensor([tanfovx, tanfovy, focal_x, focal_y]).cuda()
+
+    rasterizer = setup_scene_rasterizer()
+    
+    pre_input = torch.zeros((plt3DGS._width, plt3DGS._height, 5), dtype=torch.float)
+    # last channel set to 1
+    pre_input[:, :, 4] = 1
+    pre_input = pre_input.cuda()
+
+    cur_id = 150000
+    final_id = cur_id + 10000
+    max_gaussian = 1024
+    while cur_id < final_id:
+        print("cur_id: ", cur_id)
+        end_id = min(cur_id + max_gaussian, final_id)
+        means_i = means[cur_id:end_id]
+        s_i = s[cur_id:end_id]
+        r_i = r[cur_id:end_id]
+        color_i = colors[cur_id:end_id]
+        pre_input = rasterizer.apply(plt3DGS._width, plt3DGS._height, means_i, s_i, r_i, viewM, projM, view_angle, end_id-cur_id, color_i, pre_input)
+        cur_id = end_id
+
+
+    pre_input = pre_input.detach().cpu().numpy()
+
+    # get the first 4 channels
+    pre_input = pre_input[:, :, :4]
+    # print(sample[13, 13])
+    # print(sample[13, 12])
+    # print(sample[1, 3])
+    # print(sample[2, 3])
+    sample = np.rot90(pre_input)
+    plt.imshow(sample)
+    plt.show()
+    return sample
 
 
 def in_triangle(x, y, x1, y1, x2, y2, x3, y3):
@@ -556,12 +942,6 @@ def rasterize_tri_3D(vertices, color, camera_params):
     x_dim = width // math.sqrt(max_t)
     y_dim = height // math.sqrt(max_t)
 
-    # for x in range(width):
-    #     for y in range(height):
-    #         # print(x, y)
-    #         if in_triangle(x, y, vertices_screen[0][0], vertices_screen[0][1], vertices_screen[1][0], vertices_screen[1][1], vertices_screen[2][0], vertices_screen[2][1]):
-    #             output[x, y] = color
-
     threads = []
 
     for i in range(int(math.floor(math.sqrt(max_t)))):
@@ -580,17 +960,20 @@ def rasterize_tri_3D(vertices, color, camera_params):
     # torch to np array
     output = output.cpu().numpy()
     output = np.rot90(output)
-    # plt.imshow(output)
-    # plt.show()
+    plt.imshow(output)
+    plt.show()
     return output
 
 
 def test_tri_rast():
-    cam_para = CameraParams(eye=torch.Tensor([20, 0, 100]), center=torch.Tensor([20, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=50, far=500, width=128, height=128)
+    cam_para = CameraParams(eye=torch.Tensor([0, 0, 20]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=5, far=500, width=128, height=128)
 
-    p0 = torch.Tensor([-10, 0, 0, 1])
-    p1 = torch.Tensor([10, 0, 0, 1])
-    p2 = torch.Tensor([0, 10, 0, 1])
+    # p0 = torch.Tensor([-10, 0, 0, 1])
+    # p1 = torch.Tensor([10, 0, 0, 1])
+    # p2 = torch.Tensor([0, 10, 0, 1])
+    p0 = torch.Tensor([-1, -1, 0, 1])
+    p1 = torch.Tensor([1, -1, 0, 1])
+    p2 = torch.Tensor([1, 1, 0, 1])
 
     color = torch.Tensor([0, 1, 0, 1])
     rasterize_tri_3D(torch.stack([p0, p1, p2]), color, cam_para)
@@ -630,6 +1013,14 @@ def test_rast_n_G_color_slang():
     color = torch.Tensor([[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]])
     rasterize_n_G_color_slang(means, s, r, cam_para, color)
 
+def test_rast_n_G_scene_slang_sample():
+    cam_para = CameraParams(eye=torch.Tensor([50, 0, 0]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=10, far=5000, width=30, height=30)
+    means = torch.Tensor([[0, 0, 0, 1], [0, 0, -4, 1], [10, 0, -10, 1]])
+    s = torch.Tensor([[100, 100, 100], [100, 100, 100], [100, 100, 100]])
+    r = torch.Tensor([[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]])
+    color = torch.Tensor([[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]])
+    rasterize_n_G_scene_slang(means, s, r, cam_para, color)
+
 def test_3DGS_scene_Train():
     sh_degree = 3
     cam_para = get_sample_camera()
@@ -637,7 +1028,8 @@ def test_3DGS_scene_Train():
     ply_path = os.path.join(cur_dir, "models/train/point_cloud/iteration_30000/point_cloud.ply")
     plt_3DGS = Plt3DGS(sh_degree, ply_path)
     plt_3DGS.get_color(cam_para['camera_center'])
-    rast_3DGS_scene(plt_3DGS, cam_para)
+    # rast_3DGS_scene(plt_3DGS, cam_para)
+    rast_3DGS_scene_slang(plt_3DGS, cam_para)
 
 def compare_rast_1_G_color():
     cam_para = CameraParams(eye=torch.Tensor([0, 0, 50]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=20, far=500, width=128, height=128)
@@ -677,13 +1069,17 @@ def compare_rast_n_G_color():
 
     out_GT = rast_n_G_color(means, s, r, cam_para, color)
     out_slang = rasterize_n_G_color_slang(means_1, s_1, r_1, cam_para, color_1)
-    diff = np.sum((out_GT - out_slang)**2)
-    print("diff: ", diff)
+    out_slang_scene = rasterize_n_G_scene_slang(means_1, s_1, r_1, cam_para, color_1)
+    diff1 = np.sum((out_GT - out_slang)**2)
+    diff2 = np.sum((out_GT - out_slang_scene)**2)
+    print("diff: ", diff1, diff2)
     plt.figure
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.imshow(out_GT)
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.imshow(out_slang)
+    plt.subplot(1, 3, 3)
+    plt.imshow(out_slang_scene)
     plt.show()
 
 
@@ -760,10 +1156,10 @@ def optimize_1_G_color():
         output = rasterizer.apply(cam_para.width, cam_para.height, mean_1, s_1, r_1, viewM, projM, color_1)
         output.register_hook(set_grad(output))
 
-        # Ll1 = l1_loss(output, target)
-        # loss = (1.0 - lambda_opt) * Ll1 + lambda_opt * (1.0 - ssim(output, target))
+        Ll1 = l1_loss(output, target)
+        loss = (1.0 - lambda_opt) * Ll1 + lambda_opt * (1.0 - ssim(output, target))
 
-        loss = torch.mean((output - target) ** 2)
+        # loss = torch.mean((output - target) ** 2)
         loss.backward()
         optimizer.step()
     
@@ -777,7 +1173,7 @@ def optimize_1_G_color():
                 output = np.rot90(output)
                 mean_1_np = mean_1.detach().cpu().numpy()
                 plt.imshow(output)
-                plt.savefig(os.path.join(image_dir, "output_%d.png" % i))
+                plt.savefig(os.path.join(image_gaussian_dir, "output_%d.png" % i))
                 plt.close()
                 print(i, "mean_1: ", mean_1_np)
 
@@ -847,7 +1243,7 @@ def optimize_n_G_color():
         targets.append(target)
         plt.imshow(target_show)
         # plt.show()
-        plt.savefig(os.path.join(image_dir, "target_%d.png" % i))
+        plt.savefig(os.path.join(image_gaussian_dir, "target_%d.png" % i))
         plt.close()
 
     
@@ -859,16 +1255,27 @@ def optimize_n_G_color():
         {'params': color_1, 'lr': 0.001}
     ])
 
-    def optimize(i):
-        optimizer.zero_grad()
-        
+    def optimize(i, means_op, s_op, r_op, color_op):
         sample_cam = random.uniform(0, len(cam_paras))
         cam_para1 = cam_paras[int(sample_cam)]
 
+        means_came = torch.zeros_like(means_op)
+        for j in range(means_op.shape[0]):
+            means_came[j] = cam_para1.M_view @ means_op[j]
+        
+        # sort the means_op by depth
+        indices = torch.argsort(means_came[:, 2], descending=True)
+        s_op = s_op[indices]
+        r_op = r_op[indices]
+        color_op = color_op[indices]
+        means_op = means_op[indices]
+
+        optimizer.zero_grad()
+    
         if i % 100 == 0:
             print("Iteration %d, sample_cam: %d" % (i, int(sample_cam)))
 
-        output = rasterizer.apply(cam_para1.width, cam_para1.height, means_1, s_1, r_1, cam_para1.M_view, cam_para1.M_proj, view_angle, gaussian_range, color_1)
+        output = rasterizer.apply(cam_para1.width, cam_para1.height, means_op, s_op, r_op, cam_para1.M_view, cam_para1.M_proj, view_angle, gaussian_range, color_op)
         output.register_hook(set_grad(output))
 
         cur_target = targets[int(sample_cam)]
@@ -878,7 +1285,7 @@ def optimize_n_G_color():
         optimizer.step()
 
     for i in range(numIterations):
-        optimize(i)
+        optimize(i, means_1, s_1, r_1, color_1)
         if i % 100 == 0:
             with torch.no_grad():
                 sample_cam = 2
@@ -888,7 +1295,7 @@ def optimize_n_G_color():
                 output = np.rot90(output)
                 means_1_np = means_1.detach().cpu().numpy()
                 plt.imshow(output)
-                plt.savefig(os.path.join(image_dir, "output_%d.png" % i))
+                plt.savefig(os.path.join(image_gaussian_dir, "output_%d.png" % i))
                 plt.close()
                 print(i, "mean_1: ", means_1_np)
     
@@ -899,16 +1306,450 @@ def optimize_n_G_color():
         output_f = np.rot90(output_f)
         plt.imshow(output_f)
         # plt.show()
-        plt.savefig(os.path.join(image_dir, "output_final_%d.png" % i))
+        plt.savefig(os.path.join(image_gaussian_dir, "output_final_%d.png" % i))
         plt.close()
 
+def load_png_as_np(image):
+    img = Image.open(image)
+    img = np.array(img).astype(np.float32)
+    img /= 255.0
+    return img
 
+def setup_training_set(Train_set):
+    # test_set = [("x0_y_10_z0_cube.png", [0,0,-10]), ("x_8_y_6_z0_cube.png", [-8,0,-6]), ("x_9_1_y_4_2_z0_cube.png", [-9.1,0,-4.2]), ("x_10_y0_z0_cube.png", [-10,0,0])]
+    cur_dir = os.path.dirname(os.path.realpath(__file__))
+    Train_data_dir = os.path.join(cur_dir, "Train")
+    Train_data_dir = os.path.join(Train_data_dir, Train_set)
+    # read train.txt
+    Train_sum_dir = os.path.join(Train_data_dir, "train.txt")
+    with open(Train_sum_dir, "r") as f:
+        lines = f.readlines()
+    test_set = []
+    for i in range(1, len(lines)):
+        line = lines[i].split()
+        image_name = line[0] + ".png"
+        cam_para = [float(line[1]), float(line[2]), float(line[3])]
+        test_set.append([image_name, cam_para])
+
+    complete_set = []
+    for i in range(len(test_set)):
+        image_name = test_set[i][0]
+        image_dir = os.path.join(Train_data_dir, image_name)
+        img1 = load_png_as_np(image_dir).astype(np.float32)
+        cam1 = CameraParams(eye=torch.Tensor(test_set[i][1]), center=torch.Tensor([0, 0, 0]), up=torch.Tensor([0, 1, 0]), fov=60, aspect=1, near=5, far=500, width=256, height=256)
+        set1 = [img1, cam1]
+        complete_set.append(set1)
+    return complete_set
+
+def optimize_blender():
+    task = "Comb"
+    rasterizer = setup_nG_rasterizer()
+    train_set = setup_training_set(task)
+    # train_set = setup_training_set("Cube")
+
+    cam_paras = []
+    targets = []
+    for i in range(len(train_set)):
+        cam_paras.append(train_set[i][1])
+        cam_paras[i].M_view = cam_paras[i].M_view.cuda()
+        cam_paras[i].M_proj = cam_paras[i].M_proj.cuda()
+        target_show = train_set[i][0]
+        plt.imshow(target_show)
+        # plt.show()
+        plt.savefig(os.path.join(image_blender_dir, f"target_{i}.png"))
+        plt.close()
+
+        targets.append(torch.Tensor(train_set[i][0]).cuda())
+
+    guassian_num = 1024
+    means = []
+    r = []
+    s = []
+    colors = []
+
+    if task == "Cube":
+        for i in range(guassian_num):
+            x = random.uniform(-1, 1)
+            y = random.uniform(-.5, .5)
+            z = random.uniform(-0.5, 0.5)
+            means.append([x, y, z, 1])
+            r.append([1, 0, 0, 0])
+            s.append([10, 10, 10])
+            colors.append([1, 0.4, 0.4, 1])
+    elif task == "Torus":
+        for i in range(guassian_num):
+            phi = random.uniform(-math.pi, math.pi)
+            x = math.cos(phi) * 2
+            y = math.sin(phi) * 2
+            z = random.uniform(-0.3, 0.3)
+            means.append([x, y, z, 1])
+            r.append([1, 0, 0, 0])
+            s.append([10, 10, 10])
+            colors.append([0.4, 1, 0.4, 1])
+    elif task == "Comb":
+        for_cube = guassian_num // 2
+        for i in range(for_cube):
+            x = random.uniform(-1, 1)
+            y = random.uniform(-.5, .5)
+            z = random.uniform(-0.5, 0.5)
+            means.append([x, y, z, 1])
+            r.append([1, 0, 0, 0])
+            s.append([10, 10, 10])
+            colors.append([1, 0.4, 0.4, 1])
+        for i in range(guassian_num - for_cube):
+            phi = random.uniform(-math.pi, math.pi)
+            x = math.cos(phi) * 2
+            y = math.sin(phi) * 2
+            z = random.uniform(-0.3, 0.3)
+            means.append([x, y, z, 1])
+            r.append([1, 0, 0, 0])
+            s.append([10, 10, 10])
+            colors.append([0.4, 1, 0.4, 1])
+
+    means = torch.Tensor(means).cuda().requires_grad_(True)
+    r = torch.Tensor(r).cuda().requires_grad_(True)
+    s = torch.Tensor(s).cuda().requires_grad_(True)
+    colors = torch.Tensor(colors).cuda().requires_grad_(True)
+
+    cam1 = cam_paras[2]
+
+    view_angle_rad = cam1.fov * math.pi / 180
+    tanfovx = math.tan(view_angle_rad * 0.5)
+    tanfovy = math.tan(view_angle_rad * 0.5)
+    focal_y = cam1.height / (2.0 * tanfovy)
+    focal_x = cam1.width / (2.0 * tanfovx)
+    view_angle = torch.Tensor([tanfovx, tanfovy, focal_x, focal_y]).cuda()
+    # cam1.M_view = cam1.M_view.cuda()
+    # cam1.M_proj = cam1.M_proj.cuda()
+
+    target = rasterizer.apply(cam1.width, cam1.height, means, s, r, cam1.M_view, cam1.M_proj, view_angle, guassian_num, colors)
+    target_show = target.detach().cpu().numpy()
+    # target_show = np.rot90(target_show)
+    plt.imshow(target_show)
+    plt.show()
+    # plt.close()
+
+    numIterations = 2000
+    optimizer = torch.optim.Adam([
+        {'params': means, 'lr': 0.01, "name": "means"},
+        {'params': s, 'lr': 0.04, "name": "s"},
+        {'params': r, 'lr': 0.00001, "name": "r"},
+        {'params': colors, 'lr': 0.01, "name": "colors"}
+    ])
+
+    lr_func = get_expon_lr_func(0.01, 0.0001, 600, 0.5, 2000)
+
+    def optimize(i, means_op, s_op, r_op, colors_op):
+        lambda_opt = 0.2
+        sample_cam = random.uniform(0, len(cam_paras))
+        cam_para1 = cam_paras[int(sample_cam)]
+
+        means_came = torch.zeros_like(means_op)
+        for j in range(means_op.shape[0]):
+            means_came[j] = cam_para1.M_view @ means_op[j]
+        
+        # sort the means_op by depth
+        indices = torch.argsort(means_came[:, 2], descending=True)
+        s_op = s_op[indices]
+        r_op = r_op[indices]
+        colors_op = colors_op[indices]
+        means_op = means_op[indices]
+
+        update_learning_rate(optimizer, lr_func, i)
+        optimizer.zero_grad()
+        if i % 100 == 0:
+            print("Iteration %d, sample_cam: %d" % (i, int(sample_cam)))
+
+        output = rasterizer.apply(cam_para1.width, cam_para1.height, means_op, s_op, r_op, cam_para1.M_view, cam_para1.M_proj, view_angle, guassian_num, colors_op)
+        # print("output: ", output)
+        output.register_hook(set_grad(output))
+
+        cur_target = targets[int(sample_cam)]
+
+        Ll1 = l1_loss(output, cur_target)
+        loss = (1.0 - lambda_opt) * Ll1 + lambda_opt * (1.0 - ssim(output, cur_target))
+        if i % 100 == 0:
+            print("Iteration %d, loss: %f" % (i, loss))
+            print("optimizer means: ", optimizer.param_groups[0]['lr'])
+        loss.backward()
+        optimizer.step()
+
+    for i in range(numIterations):
+        optimize(i, means, s, r, colors)
+        if i % 100 == 0:
+            with torch.no_grad():
+                sample_cam = 3
+                cam_para1 = cam_paras[int(sample_cam)]
+
+                # means_came = torch.zeros_like(means)
+                # for j in range(means.shape[0]):
+                #     means_came[j] = cam_para1.M_view @ means[j]
+                
+                # # sort the means by depth
+                # indices = torch.argsort(means_came[:, 2], descending=True)
+                # s = s[indices]
+                # r = r[indices]
+                # colors = colors[indices]
+                # means = means[indices]
+
+                output = rasterizer.apply(cam_para1.width, cam_para1.height, means, s, r, cam_para1.M_view, cam_para1.M_proj, view_angle, guassian_num, colors)
+                output = output.detach().cpu().numpy()
+                # output = np.rot90(output)
+                means_np = means.detach().cpu().numpy()
+                r_np = r.detach().cpu().numpy()
+                s_np = s.detach().cpu().numpy()
+                colors_np = colors.detach().cpu().numpy()
+                plt.imshow(output)
+                plt.savefig(os.path.join(image_blender_dir, "output_%d.png" % i))
+                plt.close()
+                # print(i, "mean: ", means_np)
+                # print(i, "r: ", r_np)
+                # print(i, "s: ", s_np)
+                # print(i, "colors: ", colors_np)
+
+    with torch.no_grad():
+        for i in range(len(cam_paras)):
+            cam_para1 = cam_paras[i]
+
+            means_came = torch.zeros_like(means)
+            for j in range(means.shape[0]):
+                means_came[j] = cam_para1.M_view @ means[j]
+            
+            # sort the means by depth
+            indices = torch.argsort(means_came[:, 2], descending=True)
+            s = s[indices]
+            r = r[indices]
+            colors = colors[indices]
+            means = means[indices]
+
+            output_f = rasterizer.apply(cam_para1.width, cam_para1.height, means, s, r, cam_para1.M_view, cam_para1.M_proj, view_angle, guassian_num, colors)
+            output_f = output_f.detach().cpu().numpy()
+            # output_f = np.rot90(output_f)
+            plt.imshow(output_f)
+            # plt.show()
+            plt.savefig(os.path.join(image_blender_dir, "output_final_%d.png" % i))
+            plt.close()
+
+    # plot the 3D distribution of the gaussian
+    means_np = means.detach().cpu().numpy()
+    colors_np = colors.detach().cpu().numpy()
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_xlabel('X Label')
+    ax.set_ylabel('Y Label')
+    ax.set_zlabel('Z Label')
+    ax.set_xlim(-2, 2)
+    ax.set_ylim(-2, 2)
+    ax.set_zlim(-2, 2)
+    # add color bar for c
+    cbar = plt.colorbar(ax.scatter(means_np[:, 0], means_np[:, 2], means_np[:, 1], c=colors_np[:, 3], marker='o'))
+    cbar.set_label('Alpha Value')
+    plt.show()
+
+
+def optimize_blender_scene():
+    rasterizer = setup_scene_rasterizer()
+    train_set = setup_training_set()
+    cam_paras = []
+    targets = []
+    for i in range(len(train_set)):
+        cam_paras.append(train_set[i][1])
+        cam_paras[i].M_view = cam_paras[i].M_view.cuda()
+        cam_paras[i].M_proj = cam_paras[i].M_proj.cuda()
+        target_show = train_set[i][0]
+        plt.imshow(target_show)
+        # plt.show()
+        plt.savefig(os.path.join(image_blender_dir, f"target_{i}.png"))
+        plt.close()
+
+        targets.append(torch.Tensor(train_set[i][0]).cuda())
+
+    guassian_num = 512
+    means = []
+    r = []
+    s = []
+    colors = []
+
+    for i in range(guassian_num):
+        x = random.uniform(-1, 1)
+        y = random.uniform(-.5, .5)
+        z = random.uniform(-0.5, 0.5)
+        means.append([x, y, z, 1])
+        r.append([1, 0, 0, 0])
+        s.append([10, 10, 10])
+        colors.append([1, 0.4, 0.4, 1])
+
+    means = torch.Tensor(means).cuda().requires_grad_(True)
+    r = torch.Tensor(r).cuda().requires_grad_(True)
+    s = torch.Tensor(s).cuda().requires_grad_(True)
+    colors = torch.Tensor(colors).cuda().requires_grad_(True)
+
+    cam1 = cam_paras[0]
+
+    view_angle_rad = cam1.fov * math.pi / 180
+    tanfovx = math.tan(view_angle_rad * 0.5)
+    tanfovy = math.tan(view_angle_rad * 0.5)
+    focal_y = cam1.height / (2.0 * tanfovy)
+    focal_x = cam1.width / (2.0 * tanfovx)
+    view_angle = torch.Tensor([tanfovx, tanfovy, focal_x, focal_y]).cuda()
+    # cam1.M_view = cam1.M_view.cuda()
+    # cam1.M_proj = cam1.M_proj.cuda()
+
+    pre_input = torch.zeros((cam1.width, cam1.height, 5), dtype=torch.float).cuda()
+    pre_input[:, :, 4] = 1
+    st = 0
+    cap = 16
+    while st < guassian_num:
+        ed = min(st + cap, guassian_num)
+        output = rasterizer.apply(cam1.width, cam1.height, means[st:ed], s[st:ed], r[st:ed], cam1.M_view, cam1.M_proj, view_angle, ed - st, colors[st:ed], pre_input)
+        pre_input = output
+        st = ed
+    target = pre_input
+    target_show = target.detach().cpu().numpy()
+    target_show = target_show[:, :, 0:4]
+    # target_show = np.rot90(target_show)
+    plt.imshow(target_show)
+    plt.show()
+
+    numIterations = 2000
+    optimizer = torch.optim.Adam([
+        {'params': means, 'lr': 0.01},
+        {'params': s, 'lr': 0.0001},
+        {'params': r, 'lr': 0.00001},
+        {'params': colors, 'lr': 0.01}
+    ])
+
+    lr_func = get_expon_lr_func(0.01, 0.00001, 600, 0.5, 4000)
+
+    def optimize(i, means_op, s_op, r_op, colors_op):
+        lambda_opt = 0.2
+        sample_cam = random.uniform(0, len(cam_paras))
+        cam_para1 = cam_paras[int(sample_cam)]
+
+        means_came = torch.zeros_like(means_op)
+        for j in range(means_op.shape[0]):
+            means_came[j] = cam_para1.M_view @ means_op[j]
+        
+        # sort the means_op by depth
+        indices = torch.argsort(means_came[:, 2], descending=True)
+        s_op = s_op[indices]
+        r_op = r_op[indices]
+        colors_op = colors_op[indices]
+        means_op = means_op[indices]
+
+        update_learning_rate(optimizer, lr_func, i)
+
+        optimizer.zero_grad()
+        if i % 100 == 0:
+            print("Iteration %d, sample_cam: %d" % (i, int(sample_cam)))
+
+        pre_input = torch.zeros((cam1.width, cam1.height, 5), dtype=torch.float).cuda()
+        pre_input[:, :, 4] = 1
+
+        st = 0
+        cap = 16
+        while st < guassian_num:
+            ed = min(st + cap, guassian_num)
+            output = rasterizer.apply(cam_para1.width, cam_para1.height, means_op[st:ed], s_op[st:ed], r_op[st:ed], cam_para1.M_view, cam_para1.M_proj, view_angle, ed - st, colors_op[st:ed], pre_input)
+            pre_input = output
+            st = ed
+        # print("output: ", output)
+        output.register_hook(set_grad(output))
+
+        cur_target = targets[int(sample_cam)]
+
+        Ll1 = l1_loss(output[:, :, 0:4], cur_target)
+        loss = (1.0 - lambda_opt) * Ll1 + lambda_opt * (1.0 - ssim(output[:, :, 0:4], cur_target))
+        if i % 100 == 0:
+            print("Iteration %d, loss: %f" % (i, loss))
+        loss.backward()
+        optimizer.step()
+
+    for i in range(numIterations):
+        optimize(i, means, s, r, colors)
+        if i % 100 == 0:
+            with torch.no_grad():
+                sample_cam = 0
+                cam_para1 = cam_paras[int(sample_cam)]
+
+                # means_came = torch.zeros_like(means)
+                # for j in range(means.shape[0]):
+                #     means_came[j] = cam_para1.M_view @ means[j]
+                
+                # # sort the means by depth
+                # indices = torch.argsort(means_came[:, 2], descending=True)
+                # s = s[indices]
+                # r = r[indices]
+                # colors = colors[indices]
+                # means = means[indices]
+
+                pre_input = torch.zeros((cam1.width, cam1.height, 5), dtype=torch.float).cuda()
+                pre_input[:, :, 4] = 1
+                st = 0
+                cap = 16
+                while st < guassian_num:
+                    ed = min(st + cap, guassian_num)
+                    output = rasterizer.apply(cam_para1.width, cam_para1.height, means[st:ed], s[st:ed], r[st:ed], cam_para1.M_view, cam_para1.M_proj, view_angle, ed - st, colors[st:ed], pre_input)
+                    pre_input = output
+                    st = ed
+                output = output.detach().cpu().numpy()
+                # output = np.rot90(output)
+                means_np = means.detach().cpu().numpy()
+                r_np = r.detach().cpu().numpy()
+                s_np = s.detach().cpu().numpy()
+                colors_np = colors.detach().cpu().numpy()
+                plt.imshow(output[:, :, 0:4])
+                plt.savefig(os.path.join(image_blender_dir, "output_%d.png" % i))
+                plt.close()
+                # print(i, "mean: ", means_np)
+                # print(i, "r: ", r_np)
+                # print(i, "s: ", s_np)
+                # print(i, "colors: ", colors_np)
+
+    with torch.no_grad():
+        for i in range(len(cam_paras)):
+            cam_para1 = cam_paras[i]
+
+            means_came = torch.zeros_like(means)
+            for j in range(means.shape[0]):
+                means_came[j] = cam_para1.M_view @ means[j]
+            
+            # sort the means by depth
+            indices = torch.argsort(means_came[:, 2], descending=True)
+            s = s[indices]
+            r = r[indices]
+            colors = colors[indices]
+            means = means[indices]
+
+            pre_input = torch.zeros((cam1.width, cam1.height, 5), dtype=torch.float).cuda()
+            pre_input[:, :, 4] = 1
+            st = 0
+            cap = 16
+            while st < guassian_num:
+                ed = min(st + cap, guassian_num)
+                output = rasterizer.apply(cam_para1.width, cam_para1.height, means[st:ed], s[st:ed], r[st:ed], cam_para1.M_view, cam_para1.M_proj, view_angle, ed - st, colors[st:ed], pre_input)
+                pre_input = output
+                st = ed
+
+            output_f = pre_input
+            output_f = output_f.detach().cpu().numpy()
+            # output_f = np.rot90(output_f)
+            plt.imshow(output_f[:, :, 0:4])
+            # plt.show()
+            plt.savefig(os.path.join(image_blender_dir, "output_final_%d.png" % i))
+            plt.close()
+    
+
+# test_tri_rast()
 # test_rast_1_G_color()
 # test_rast_1_G_color_slang()
 # compare_rast_1_G_color()
 # optimize_1_G_color()
 # test_rast_n_G_color()
 # test_rast_n_G_color_slang()
+# test_rast_n_G_scene_slang_sample()
 # compare_rast_n_G_color()
-optimize_n_G_color()
+# optimize_n_G_color()
 # test_3DGS_scene_Train()
+optimize_blender()
+# optimize_blender_scene()  # doesn't work

@@ -31,14 +31,14 @@ float3x3 getScalingMatrix(float3 s)
 float2x2 compute_Conv2D(float4 mean, float4x4 viewM, float3x3 Sig, float4 view_angle)
 {
     float4 t = mul(viewM, mean);
-    // float limx = 1.3f * view_angle[0];
-    // float limy = 1.3f * view_angle[1];
-    // float txtz = t.x / t.z;
-    // float tytz = t.y / t.z;
-    // float focal_x = view_angle[2];
-    // float focal_y = view_angle[3];
-    // t.x = min(limx, max(-limx, txtz)) * t.z;
-    // t.y = min(limy, max(-limy, tytz)) * t.z;
+    float limx = 1.3f * view_angle[0];
+    float limy = 1.3f * view_angle[1];
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    float focal_x = view_angle[2];
+    float focal_y = view_angle[3];
+    t.x = min(limx, max(-limx, txtz)) * t.z;
+    t.y = min(limy, max(-limy, tytz)) * t.z;
 
     float3x3 J = float3x3(1.0 / t.z, 0, -t.x / (t.z * t.z), 0, 1.0 / t.z, -t.y / (t.z * t.z), 0, 0, 0);
     // float3x3 J = float3x3(focal_x / t.z, 0, -(focal_x * t.x) / (t.z * t.z), 0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z), 0, 0, 0);
@@ -61,6 +61,7 @@ void rasterize(
     TensorView<float> projM,
     TensorView<float> view_angle,
     int gaussian_range,
+    DiffTensorView<float> pre_input,
     DiffTensorView color,
     DiffTensorView output)
 {
@@ -68,10 +69,12 @@ void rasterize(
 
     if (globalIdx.x > output.size(0) || globalIdx.y > output.size(1))
         return;
-    // float T = output.load(uint3(globalIdx.x, globalIdx.y, 4));
-    // if (T < 0.0001)
-    //     return;
-    float T = 1.0;
+    float T = pre_input.load(uint3(globalIdx.x, globalIdx.y, 4));
+    if (T < 0.0001)
+        return;
+    // float T = 1.0;
+    float4 color_track = float4(pre_input.load(uint3(globalIdx.x, globalIdx.y, 0)), pre_input.load(uint3(globalIdx.x, globalIdx.y, 1)),
+                                pre_input.load(uint3(globalIdx.x, globalIdx.y, 2)), pre_input.load(uint3(globalIdx.x, globalIdx.y, 3)));
 
     // in the order of tan_fovx, tan_fovy, focal_x, focal_y
     float4 fov_info = float4(no_diff(view_angle[0]), no_diff(view_angle[1]), no_diff(view_angle[2]), no_diff(view_angle[3]));
@@ -90,11 +93,12 @@ void rasterize(
     _projM[2] = float4(no_diff(projM[uint2(2, 0)]), no_diff(projM[uint2(2, 1)]), no_diff(projM[uint2(2, 2)]), no_diff(projM[uint2(2, 3)]));
     _projM[3] = float4(no_diff(projM[uint2(3, 0)]), no_diff(projM[uint2(3, 1)]), no_diff(projM[uint2(3, 2)]), no_diff(projM[uint2(3, 3)]));
 
-    float4 color_track = float4(0.0, 0.0, 0.0, 0.0);
 
-    for (int i = 0; i < 1024; i++)
+    for (int i = 0; i < 16; i++)
     {
         if (i == gaussian_range)
+            break;
+        if (T < 0.0001)
             break;
 
         float4 mean_0 = float4(mean[uint2(i, 0)], mean[uint2(i, 1)], mean[uint2(i, 2)], mean[uint2(i, 3)]);
@@ -143,6 +147,7 @@ void rasterize(
     output.store(uint3(globalIdx.x, globalIdx.y, 1), color_track[1]);
     output.store(uint3(globalIdx.x, globalIdx.y, 2), color_track[2]);
     output.store(uint3(globalIdx.x, globalIdx.y, 3), color_track[3]);
+    output.store(uint3(globalIdx.x, globalIdx.y, 4), T);
     return;
 
     // if (globalIdx.x == 0) {
