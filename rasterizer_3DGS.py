@@ -15,7 +15,7 @@ import random
 from PIL import Image
 
 from loader_3DGS import get_sample_camera, Plt3DGS
-from loss_util import l1_loss, ssim, get_expon_lr_func
+from loss_util import l1_loss, ssim, get_expon_lr_func, psnr_error
 
 # https://shader-slang.com/slang/user-guide/a1-02-slangpy.html
 
@@ -803,6 +803,8 @@ def rast_3DGS_scene(plt3DGS, cam_para):
 def rast_3DGS_scene_slang(plt3DGS, cam_para):
     start = time.time()
     means = plt3DGS._xyz
+    print(means.shape)
+    return
     opacity = plt3DGS._opacity
     colors = plt3DGS._colors
     r = plt3DGS._rotation
@@ -1247,7 +1249,7 @@ def optimize_n_G_color():
         plt.close()
 
     
-    numIterations = 4000
+    numIterations = 1000
     optimizer = torch.optim.Adam([
         {'params': means_1, 'lr': 0.016},
         {'params': s_1, 'lr': 1.5},
@@ -1257,6 +1259,8 @@ def optimize_n_G_color():
 
     def optimize(i, means_op, s_op, r_op, color_op):
         sample_cam = random.uniform(0, len(cam_paras))
+        if i % 100 == 0:
+            sample_cam = 2
         cam_para1 = cam_paras[int(sample_cam)]
 
         means_came = torch.zeros_like(means_op)
@@ -1272,7 +1276,7 @@ def optimize_n_G_color():
 
         optimizer.zero_grad()
     
-        if i % 100 == 0:
+        if i % 100 == 1:
             print("Iteration %d, sample_cam: %d" % (i, int(sample_cam)))
 
         output = rasterizer.apply(cam_para1.width, cam_para1.height, means_op, s_op, r_op, cam_para1.M_view, cam_para1.M_proj, view_angle, gaussian_range, color_op)
@@ -1289,15 +1293,19 @@ def optimize_n_G_color():
         if i % 100 == 0:
             with torch.no_grad():
                 sample_cam = 2
+                # target_in_cuda = torch.Tensor(targets[sample_cam]).cuda()
                 cam_para1 = cam_paras[int(sample_cam)]
                 output = rasterizer.apply(cam_para1.width, cam_para1.height, means_1, s_1, r_1, cam_para1.M_view, cam_para1.M_proj, view_angle, gaussian_range, color_1)
+                # ssim_error = ssim(output, target_in_cuda)
                 output = output.detach().cpu().numpy()
                 output = np.rot90(output)
-                means_1_np = means_1.detach().cpu().numpy()
+                # means_1_np = means_1.detach().cpu().numpy()
                 plt.imshow(output)
                 plt.savefig(os.path.join(image_gaussian_dir, "output_%d.png" % i))
                 plt.close()
-                print(i, "mean_1: ", means_1_np)
+                # psnr = psnr_error(output, targets[sample_cam].detach().cpu().numpy())
+                # print(i, "ssim: ", ssim_error, "psnr: ", psnr)
+                # print(i, "mean_1: ", means_1_np)
     
     for i in range(len(cam_paras)):
         cam_para1 = cam_paras[i]
@@ -1308,6 +1316,17 @@ def optimize_n_G_color():
         # plt.show()
         plt.savefig(os.path.join(image_gaussian_dir, "output_final_%d.png" % i))
         plt.close()
+    
+    # compare means, s, r, color and means_1, s_1, r_1, color_1 in mse
+    means_error = torch.mean((means - means_1) ** 2)
+    s_error = torch.mean((s - s_1) ** 2)
+    r_error = torch.mean((r - r_1) ** 2)
+    color_error = torch.mean((color - color_1) ** 2)
+    print("means_error: ", torch.mean(means_error))
+    print("s_error: ", torch.mean(s_error))
+    print("r_error: ", torch.mean(r_error))
+    print("color_error: ", torch.mean(color_error))
+
 
 def load_png_as_np(image):
     img = Image.open(image)
@@ -1361,7 +1380,13 @@ def optimize_blender():
 
         targets.append(torch.Tensor(train_set[i][0]).cuda())
 
-    guassian_num = 1024
+    # pick random one to be the testing set
+    # test_index = random.randint(0, len(train_set) - 1)
+    test_index = 3
+    test_cam = [cam_paras[test_index]]
+    test_target = [targets[test_index]]
+
+    guassian_num = 32
     means = []
     r = []
     s = []
@@ -1405,6 +1430,15 @@ def optimize_blender():
             r.append([1, 0, 0, 0])
             s.append([10, 10, 10])
             colors.append([0.4, 1, 0.4, 1])
+    elif task == "Monkey":
+        for i in range(guassian_num):
+            x = random.uniform(-2, 2)
+            y = random.uniform(-2, 2)
+            z = random.uniform(-2, 2)
+            means.append([x, y, z, 1])
+            r.append([1, 0, 0, 0])
+            s.append([10, 10, 10])
+            colors.append([1, 0.4, 0.4, 1])
 
     means = torch.Tensor(means).cuda().requires_grad_(True)
     r = torch.Tensor(r).cuda().requires_grad_(True)
@@ -1442,6 +1476,8 @@ def optimize_blender():
     def optimize(i, means_op, s_op, r_op, colors_op):
         lambda_opt = 0.2
         sample_cam = random.uniform(0, len(cam_paras))
+        while sample_cam == test_index:
+            sample_cam = random.uniform(0, len(cam_paras))
         cam_para1 = cam_paras[int(sample_cam)]
 
         means_came = torch.zeros_like(means_op)
@@ -1478,7 +1514,9 @@ def optimize_blender():
         optimize(i, means, s, r, colors)
         if i % 100 == 0:
             with torch.no_grad():
-                sample_cam = 3
+                sample_cam = test_index
+                # if sample_cam == test_index:
+                #     sample_cam = 2
                 cam_para1 = cam_paras[int(sample_cam)]
 
                 # means_came = torch.zeros_like(means)
@@ -1508,8 +1546,10 @@ def optimize_blender():
                 # print(i, "colors: ", colors_np)
 
     with torch.no_grad():
+        train_psnr = 0
         for i in range(len(cam_paras)):
             cam_para1 = cam_paras[i]
+            start_time = time.time()
 
             means_came = torch.zeros_like(means)
             for j in range(means.shape[0]):
@@ -1522,22 +1562,39 @@ def optimize_blender():
             colors = colors[indices]
             means = means[indices]
 
+            end_time1 = time.time()
+
             output_f = rasterizer.apply(cam_para1.width, cam_para1.height, means, s, r, cam_para1.M_view, cam_para1.M_proj, view_angle, guassian_num, colors)
             output_f = output_f.detach().cpu().numpy()
+            end_time = time.time()
             # output_f = np.rot90(output_f)
             plt.imshow(output_f)
+            print("sample cam: ", i)
             # plt.show()
-            plt.savefig(os.path.join(image_blender_dir, "output_final_%d.png" % i))
+            if i == test_index:
+                plt.savefig(os.path.join(image_blender_dir, "output_final_%d_t.png" % test_index))
+
+                psnr = psnr_error(output_f, test_target[0].detach().cpu().numpy())
+                print("psnr test: ", psnr)
+                print("total time: ", (end_time - start_time)*1000)
+                print("render time: ", (end_time - end_time1)*1000)
+
+            else:
+                plt.savefig(os.path.join(image_blender_dir, "output_final_%d.png" % i))
+                psnr = psnr_error(output_f, targets[i].detach().cpu().numpy())
+                train_psnr += psnr
+                # print("psnr: ", psnr)
             plt.close()
+        print("train psnr: ", train_psnr / (len(cam_paras) - 1))
 
     # plot the 3D distribution of the gaussian
     means_np = means.detach().cpu().numpy()
     colors_np = colors.detach().cpu().numpy()
     fig = plt.figure()
     ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlabel('X Label')
-    ax.set_ylabel('Y Label')
-    ax.set_zlabel('Z Label')
+    ax.set_xlabel('X Axis')
+    ax.set_ylabel('Y Axis')
+    ax.set_zlabel('Z Axis')
     ax.set_xlim(-2, 2)
     ax.set_ylim(-2, 2)
     ax.set_zlim(-2, 2)
@@ -1750,6 +1807,6 @@ def optimize_blender_scene():
 # test_rast_n_G_scene_slang_sample()
 # compare_rast_n_G_color()
 # optimize_n_G_color()
-# test_3DGS_scene_Train()
-optimize_blender()
+test_3DGS_scene_Train()
+# optimize_blender()
 # optimize_blender_scene()  # doesn't work

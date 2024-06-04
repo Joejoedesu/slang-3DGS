@@ -31,6 +31,14 @@ def create_window(window_size, channel):
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
     return window
 
+def psnr_error(img1, img2):
+    mse = np.mean((img1 - img2) ** 2)
+    print("MSE: ", mse)
+    maxval = 1.0
+    if mse == 0:
+        return 100
+    return 20 * np.log10(maxval / np.sqrt(mse))
+
 def ssim(img1, img2, window_size=11, size_average=True):
     channel = img1.size(-3)
     window = create_window(window_size, channel)

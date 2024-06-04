@@ -92,7 +92,7 @@ void rasterize(
 
     float4 color_track = float4(0.0, 0.0, 0.0, 0.0);
 
-    for (int i = 0; i < 1024; i++)
+    for (int i = 0; i < 32; i++)
     {
         if (i == gaussian_range)
             break;

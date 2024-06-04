@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import struct
 import threading
 import time
+from PIL import Image
+import glob
+# natural sort
+from natsort import natsorted
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -39,6 +43,40 @@ C4 = [
     0.6258357354491761,
 ]
 
+
+image_dir_root = "images"
+gaussian_dir = "gaussian"
+blender_dir = "blender"
+gif_dir = "gif"
+
+image_gaussian_dir = os.path.join(image_dir_root, gaussian_dir)
+image_blender_dir = os.path.join(image_dir_root, blender_dir)
+image_gif_dir = os.path.join(image_dir_root, gif_dir)
+
+def create_gif():
+    image_files = sorted(glob.glob(os.path.join(image_gif_dir, "*.png")), key=os.path.getmtime)
+    image_files = natsorted(image_files)
+    print(image_files)
+
+    # Ensure there are images to create a GIF
+    if not image_files:
+        print("No images found in the specified folder.")
+        return
+
+    # Open the images and store them in a list
+    images = [Image.open(image) for image in image_files]
+    output_file = os.path.join(image_gif_dir, "output.gif")
+    duration = 300  # Duration is in milliseconds
+    
+    # Save the images as a GIF
+    images[0].save(
+        output_file,
+        save_all=True,
+        append_images=images[1:],
+        duration=duration,
+        loop=0
+    )
+    print(f"GIF saved as {output_file}")
 
 def eval_sh(deg, sh, dirs):
     """
@@ -339,6 +377,7 @@ def sample_depth():
 
 
 # sample_depth()
+# create_gif()
 
 ##################### JUNK CODE #####################
 
