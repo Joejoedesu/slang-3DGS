@@ -13,7 +13,7 @@ Output: Optimized Gaussian kernel, novel view generation.
 - Mile Stones
   - Single Gaussian Optimization with slang-py in a synthesized scene
   - Multi-Gaussian Optimization with slang-py in a synthesized scene
-  - Re-optimization of a real scene from 3DGS paper with slang-py
+  - Re-optimization of a real scene from blender with slang-py
   -  ====== BELOW would be additional goals if the above are achieved ======
   - Export and test the slang code compiled in a rendering language (HLSL)
   - 3D scene reconstruction using slang-py code as a plug-in for the original 3DGS code
